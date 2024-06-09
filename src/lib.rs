@@ -2,6 +2,7 @@
 
 mod ip_family;
 mod keyed_limiter;
+mod masked_ip;
 
 use std::{
     error::Error,
@@ -14,7 +15,7 @@ use std::{
 use clap::Parser;
 use governor::Quota;
 use ipset::{
-    types::{AddOption, HashIp},
+    types::{AddOption, HashNet, NetDataType},
     Session,
 };
 use log::{debug, error, info};
@@ -24,6 +25,7 @@ use rustc_hash::FxHasher;
 use crate::{
     ip_family::{ByIpFamily, IpFamily},
     keyed_limiter::KeyedLimiter,
+    masked_ip::{Mask, MaskedIpAddr},
 };
 
 #[derive(Parser, Debug)]
@@ -71,6 +73,15 @@ pub struct Args {
     #[arg(long)]
     pub ipset_ipv6_name: String,
 
+    /// Number of IPv4 prefix bits. 32 to ban individual IPs.
+    #[arg(long, default_value = "32")]
+    ipv4_prefix: u8,
+
+    /// Number of IPv6 prefix bits. 128 to ban individual IPs. 64 to ban subnets
+    /// typically assigned by ISPs.
+    #[arg(long, default_value = "64")]
+    ipv6_prefix: u8,
+
     /// The number of seconds to accumulate ban counts before reporting and
     /// resetting.
     ///
@@ -117,11 +128,13 @@ fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
 }
 
 pub struct Leroy {
-    sessions: ByIpFamily<Session<HashIp>>,
+    mask: Mask,
 
-    ip_rate_limiters: Option<KeyedLimiter<Vec<u8>, BuildHasherDefault<FxHasher>>>,
-    ipset_cache: Cache<IpAddr, (), BuildHasherDefault<FxHasher>>,
-    recidivism_counts: Cache<IpAddr, u32, BuildHasherDefault<FxHasher>>,
+    sessions: ByIpFamily<Session<HashNet>>,
+
+    ip_rate_limiters: Option<KeyedLimiter<MaskedIpAddr, BuildHasherDefault<FxHasher>>>,
+    ipset_cache: Cache<MaskedIpAddr, (), BuildHasherDefault<FxHasher>>,
+    recidivism_counts: Cache<MaskedIpAddr, u32, BuildHasherDefault<FxHasher>>,
 
     line_count: u64,
     line_count_start: Instant,
@@ -134,15 +147,21 @@ pub struct Leroy {
 
 impl Leroy {
     pub fn new(args: Args) -> Result<Leroy, Box<dyn Error>> {
+        let mask = Mask::new(ByIpFamily {
+            ipv4: args.ipv4_prefix,
+            ipv6: args.ipv6_prefix,
+        });
         Ok(Leroy {
+            mask: mask.clone(),
             sessions: ByIpFamily::try_new_with::<_, Box<dyn Error>>(|family| {
                 let (name, localhost) = match family {
                     IpFamily::V4 => (&args.ipset_ipv4_name, IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     IpFamily::V6 => (&args.ipset_ipv6_name, IpAddr::V6(Ipv6Addr::LOCALHOST)),
                 };
-                let mut session = Session::<HashIp>::new(name.clone());
+                let mut session = Session::<HashNet>::new(name.clone());
+                let localhost = mask.apply(&localhost);
                 if !args.dry_run {
-                    session.test(localhost).map_err(|err| {
+                    session.test(NetDataType::from(localhost)).map_err(|err| {
                         format!("Failed to test set {name:?}: {err}. Please create before running.")
                     })?;
                 }
@@ -179,20 +198,23 @@ impl Leroy {
     pub fn handle_line(&mut self, line: &Vec<u8>) {
         self.line_count += 1;
 
-        if self
-            .ip_rate_limiters
-            .as_mut()
-            .map_or(true, |l| l.check_key(line).is_err())
-        {
-            match IpAddr::parse_ascii(line) {
-                Ok(ip) => self.ban(ip),
-                Err(err) => error!(
-                    "Error parsing IP from {:?}: {}",
-                    String::from_utf8_lossy(line),
-                    err
-                ),
+        match IpAddr::parse_ascii(line) {
+            Ok(ip) => {
+                let ip = self.mask.apply(&ip);
+                if self
+                    .ip_rate_limiters
+                    .as_mut()
+                    .map_or(true, |l| l.check_key(&ip).is_err())
+                {
+                    self.ban(ip);
+                }
             }
-        }
+            Err(err) => error!(
+                "Error parsing IP from {:?}: {}",
+                String::from_utf8_lossy(line),
+                err
+            ),
+        };
 
         if self.line_count % 10 == 0
             && self.line_count_start.elapsed() > self.args.reporting_ip_time_period
@@ -207,7 +229,7 @@ impl Leroy {
         }
     }
 
-    fn ban(&mut self, ip: IpAddr) {
+    fn ban(&mut self, ip: MaskedIpAddr) {
         if self.ipset_cache.contains_key(&ip) {
             debug!("{ip} already banned");
             return;
@@ -220,8 +242,8 @@ impl Leroy {
             Ok(true)
         } else {
             self.sessions
-                .by_family_mut(IpFamily::from_ipv4(ip.is_ipv4()))
-                .add(ip, vec![AddOption::Timeout(timeout)])
+                .by_family_mut(ip.family())
+                .add(NetDataType::from(ip), vec![AddOption::Timeout(timeout)])
         };
 
         match ban_result {

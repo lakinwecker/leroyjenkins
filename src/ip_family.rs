@@ -14,7 +14,7 @@ impl IpFamily {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct ByIpFamily<T> {
     pub ipv4: T,
     pub ipv6: T,
